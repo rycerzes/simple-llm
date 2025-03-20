@@ -1,410 +1,501 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import math
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-class SimpleLLM(nn.Module):
-    def __init__(self, model_name):
-        super().__init__()
-        self.load_weights(model_name)
+class SimpleLLM:
+    def __init__(self):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.config = None
+        self.tokenizer = None
+        self.weights = {}
+        self.debug = False
 
     def load_weights(self, model_name):
-        """Load weights and config from HuggingFace model"""
+        """
+        load weights and config of Llama 3 models
+        """
         print(f"Loading model {model_name}...")
-        model = AutoModelForCausalLM.from_pretrained(model_name)
 
-        self.weights = {k: v.clone().detach() for k, v in model.state_dict().items()}
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.config = model.config
-
-        self.hidden_size = self.config.hidden_size
-        self.num_heads = self.config.num_attention_heads
-
-        if hasattr(self.config, "num_key_value_heads"):
-            self.num_kv_heads = self.config.num_key_value_heads
-        else:
-            self.num_kv_heads = self.num_heads
-
-        self.head_dim = self.hidden_size // self.num_heads
-        self.num_layers = self.config.num_hidden_layers
-        self.vocab_size = self.config.vocab_size
-
-        self.weight_map = self._map_weight_names()
-
-        print(
-            f"Model loaded: {self.num_layers} layers, {self.num_heads} heads, {self.hidden_size} hidden size"
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name, torch_dtype=torch.float16
         )
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    def _map_weight_names(self):
-        """Map weight names based on LLaMA architecture patterns"""
-        weight_map = {
-            "token_emb": "model.embed_tokens.weight",
-            "norm_final": "model.norm.weight",
-            "lm_head": "lm_head.weight",
+        self.config = {
+            "vocab_size": model.config.vocab_size,
+            "hidden_size": model.config.hidden_size,
+            "intermediate_size": model.config.intermediate_size,
+            "num_attention_heads": model.config.num_attention_heads,
+            "num_hidden_layers": model.config.num_hidden_layers,
+            "rms_norm_eps": model.config.rms_norm_eps,
+            "max_position_embeddings": model.config.max_position_embeddings,
+            "head_dim": model.config.hidden_size // model.config.num_attention_heads,
         }
 
-        # Map layer-specific weights
-        for i in range(self.num_layers):
-            layer_prefix = f"model.layers.{i}."
-            weight_map[f"layer_{i}_input_norm"] = (
+        # GQA specific config
+        if hasattr(model.config, "num_key_value_heads"):
+            self.config["num_key_value_heads"] = model.config.num_key_value_heads
+        else:
+            self.config["num_key_value_heads"] = self.config["num_attention_heads"]
+
+        print("\n===== Model Configuration =====")
+        for key, value in self.config.items():
+            print(f"{key}: {value}")
+        print("=============================\n")
+
+        for layer_idx in range(self.config["num_hidden_layers"]):
+            layer_prefix = f"model.layers.{layer_idx}."
+
+            # attn weights
+            q_weight = model.state_dict()[f"{layer_prefix}self_attn.q_proj.weight"].to(
+                self.device
+            )
+            k_weight = model.state_dict()[f"{layer_prefix}self_attn.k_proj.weight"].to(
+                self.device
+            )
+            v_weight = model.state_dict()[f"{layer_prefix}self_attn.v_proj.weight"].to(
+                self.device
+            )
+            o_weight = model.state_dict()[f"{layer_prefix}self_attn.o_proj.weight"].to(
+                self.device
+            )
+
+            # ff weights
+            gate_weight = model.state_dict()[f"{layer_prefix}mlp.gate_proj.weight"].to(
+                self.device
+            )
+            up_weight = model.state_dict()[f"{layer_prefix}mlp.up_proj.weight"].to(
+                self.device
+            )
+            down_weight = model.state_dict()[f"{layer_prefix}mlp.down_proj.weight"].to(
+                self.device
+            )
+
+            # layer norms
+            input_norm_weight = model.state_dict()[
                 f"{layer_prefix}input_layernorm.weight"
-            )
-            weight_map[f"layer_{i}_post_attn_norm"] = (
+            ].to(self.device)
+            post_norm_weight = model.state_dict()[
                 f"{layer_prefix}post_attention_layernorm.weight"
+            ].to(self.device)
+
+            self.weights[f"layer_{layer_idx}"] = {
+                "q_proj_weight": q_weight,
+                "k_proj_weight": k_weight,
+                "v_proj_weight": v_weight,
+                "o_proj_weight": o_weight,
+                "gate_proj_weight": gate_weight,
+                "up_proj_weight": up_weight,
+                "down_proj_weight": down_weight,
+                "input_layernorm_weight": input_norm_weight,
+                "post_attention_layernorm_weight": post_norm_weight,
+            }
+
+        # embedding and output weights
+        self.weights["token_embd"] = model.state_dict()["model.embed_tokens.weight"].to(
+            self.device
+        )
+        self.weights["norm_weight"] = model.state_dict()["model.norm.weight"].to(
+            self.device
+        )
+
+        del model
+        torch.cuda.empty_cache()
+
+        print(
+            f"Successfully loaded model with {self.config['num_hidden_layers']} layers"
+        )
+
+    def _rope_embedding(self, positions, dim, base=10000):
+        """
+        rotary positional embedding (RoPE) implementation
+        """
+        # half the dimensions because applying rotary embeddings to pairs
+        half_dim = dim // 2
+        if self.debug:
+            print(f"RoPE: positions shape = {positions.shape}, half_dim = {half_dim}")
+
+        freqs = 1.0 / (
+            base ** (torch.arange(0, half_dim).float().to(self.device) / half_dim)
+        )
+        angles = positions.unsqueeze(-1) * freqs
+        cos_emb = torch.cos(angles)
+        sin_emb = torch.sin(angles)
+
+        if self.debug:
+            print(
+                f"RoPE: cos_emb shape = {cos_emb.shape}, sin_emb shape = {sin_emb.shape}"
             )
 
-            # Attention weights
-            weight_map[f"layer_{i}_q_proj"] = f"{layer_prefix}self_attn.q_proj.weight"
-            weight_map[f"layer_{i}_k_proj"] = f"{layer_prefix}self_attn.k_proj.weight"
-            weight_map[f"layer_{i}_v_proj"] = f"{layer_prefix}self_attn.v_proj.weight"
-            weight_map[f"layer_{i}_o_proj"] = f"{layer_prefix}self_attn.o_proj.weight"
+        return cos_emb, sin_emb
 
-            # FFN weights (SwiGLU)
-            weight_map[f"layer_{i}_gate_proj"] = f"{layer_prefix}mlp.gate_proj.weight"
-            weight_map[f"layer_{i}_up_proj"] = f"{layer_prefix}mlp.up_proj.weight"
-            weight_map[f"layer_{i}_down_proj"] = f"{layer_prefix}mlp.down_proj.weight"
+    def _rotary_embedding(self, x, seq_len):
+        """RoPE to input tensors"""
+        if self.debug:
+            print(f"Rotary input shape: {x.shape}, data type: {x.dtype}")
+            print(f"Memory size: {x.nelement() * x.element_size()} bytes")
 
-        return weight_map
+        head_dim = x.shape[-1]
+        positions = torch.arange(seq_len, device=self.device)
 
-    def _rmsnorm(self, x, weight):
-        """RMSNorm used in LLaMA"""
+        cos_emb, sin_emb = self._rope_embedding(positions, head_dim)
+
+        # expand shape [1, seq_len, 1, head_dim//2] for broadcasting
+        cos_emb = cos_emb.unsqueeze(0).unsqueeze(2)  # [1, seq_len, 1, dim//2]
+        sin_emb = sin_emb.unsqueeze(0).unsqueeze(2)  # [1, seq_len, 1, dim//2]
+
+        if self.debug:
+            print(
+                f"Broadcast cos_emb shape: {cos_emb.shape}, sin_emb shape: {sin_emb.shape}"
+            )
+
+        # even and odd indices for head dimension
+        x_even = x[..., 0::2]  # [batch, seq_len, num_heads, head_dim//2]
+        x_odd = x[..., 1::2]  # [batch, seq_len, num_heads, head_dim//2]
+
+        if self.debug:
+            print(f"x_even shape: {x_even.shape}, x_odd shape: {x_odd.shape}")
+            print(f"x_even size: {x_even.nelement()}, x_odd size: {x_odd.nelement()}")
+
+        x_embed_even = x_even * cos_emb - x_odd * sin_emb
+        x_embed_odd = x_odd * cos_emb + x_even * sin_emb
+
+        x_embed = torch.zeros_like(x)
+        x_embed[..., 0::2] = x_embed_even
+        x_embed[..., 1::2] = x_embed_odd
+
+        if self.debug:
+            print(f"Rotary output shape: {x_embed.shape}")
+
+        return x_embed
+
+    def _rms_norm(self, x, weight, eps=1e-6):
+        """
+        RMSNorm
+        """
         variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + 1e-5)
+        x = x * torch.rsqrt(variance + eps)
         return weight * x
 
-    def _apply_rotary_emb(self, q, k, seq_positions):
-        """Apply rotary positional embeddings to queries and keys"""
-        device = q.device
-        head_dim = q.shape[-1]
+    def _attention(self, q, k, v, mask=None):
+        """
+        Multi-head attention
+        """
+        # scale attention scores
+        d_k = q.size(-1)
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / torch.sqrt(
+            torch.tensor(d_k, dtype=q.dtype, device=q.device)
+        )
 
-        if not hasattr(self, "freqs_cis"):
-            theta = 10000.0 ** (-torch.arange(0, head_dim, 2, device=device) / head_dim)
-            seq_idx = torch.arange(
-                4096, device=device
-            )  # Pre-compute for max sequence length
-            emb = seq_idx.unsqueeze(1) * theta.unsqueeze(0)
-            self.freqs_cis = torch.stack([torch.cos(emb), torch.sin(emb)], dim=-1)
+        # causal mask (if provided)
+        if mask is not None:
+            attn_scores = attn_scores.masked_fill(mask == 0, float("-inf"))
 
-        max_seq_len = seq_positions.max().item() + 1
-        freqs_cis = self.freqs_cis[:max_seq_len]
-        freqs_cis = freqs_cis[seq_positions]  # [bs, seq_len, dim//2, 2]
+        # softmax to get attention weights
+        attn_weights = F.softmax(attn_scores, dim=-1)
 
-        cos, sin = freqs_cis[..., 0], freqs_cis[..., 1]
+        # attention weights to values
+        output = torch.matmul(attn_weights, v)
 
-        cos = cos.view(*cos.shape, 1).expand(-1, -1, -1, 2)
-        sin = sin.view(*sin.shape, 1).expand(-1, -1, -1, 2)
-        cos = cos.reshape(*cos.shape[:-2], head_dim)
-        sin = sin.reshape(*sin.shape[:-2], head_dim)
+        return output
 
-        q_rotate = torch.cat([-q[..., 1::2], q[..., ::2]], dim=-1)
-        k_rotate = torch.cat([-k[..., 1::2], k[..., ::2]], dim=-1)
+    def _feed_forward(self, x, gate_weight, up_weight, down_weight):
+        """
+        SwiGLU FFN
+        """
+        # gate and up projections
+        gate = F.silu(F.linear(x, gate_weight))
+        up = F.linear(x, up_weight)
 
-        q = q * cos + q_rotate * sin
-        k = k * cos + k_rotate * sin
+        # element-wise multiplication
+        intermediate = gate * up
 
-        return q, k
+        # down projection
+        output = F.linear(intermediate, down_weight)
+
+        return output
 
     def forward(self, input_ids):
-        """Transformer forward pass using only PyTorch operations"""
-        batch_size, seq_length = input_ids.shape
+        """
+        forward pass
 
-        hidden_states = F.embedding(
-            input_ids, self.weights[self.weight_map["token_emb"]]
+        Args:
+            input_ids: Tensor of token IDs [batch_size, seq_len]
+
+        Returns:
+            logits: Tensor of logits [batch_size, seq_len, vocab_size]
+        """
+        batch_size, seq_len = input_ids.shape
+
+        if self.debug:
+            print("\n===== Forward Pass Info =====")
+            print(f"Input shape: {input_ids.shape}")
+            print(f"Batch size: {batch_size}, Sequence length: {seq_len}")
+            print(f"Device: {self.device}")
+            print(f"Input dtype: {input_ids.dtype}")
+
+        x = F.embedding(input_ids, self.weights["token_embd"])
+
+        if self.debug:
+            print(f"Embedding shape: {x.shape}, dtype: {x.dtype}")
+
+        causal_mask = (
+            torch.tril(torch.ones(seq_len, seq_len, device=self.device))
+            .unsqueeze(0)
+            .unsqueeze(0)
         )
 
-        position_ids = torch.arange(seq_length, device=input_ids.device).unsqueeze(0)
+        if self.debug:
+            print(f"Causal mask shape: {causal_mask.shape}")
 
-        for layer_idx in range(self.num_layers):
-            residual = hidden_states
-            hidden_states = self._rmsnorm(
-                hidden_states,
-                self.weights[self.weight_map[f"layer_{layer_idx}_input_norm"]],
+        for layer_idx in range(self.config["num_hidden_layers"]):
+            if self.debug and layer_idx == 0:
+                print(f"\n--- Layer {layer_idx} ---")
+
+            layer_weights = self.weights[f"layer_{layer_idx}"]
+
+            # RMSNorm before attention
+            residual = x
+            x = self._rms_norm(
+                x, layer_weights["input_layernorm_weight"], self.config["rms_norm_eps"]
             )
 
-            # Self-attention
-            # queries, keys, values
-            q = F.linear(
-                hidden_states,
-                self.weights[self.weight_map[f"layer_{layer_idx}_q_proj"]],
-            )
-            k = F.linear(
-                hidden_states,
-                self.weights[self.weight_map[f"layer_{layer_idx}_k_proj"]],
-            )
-            v = F.linear(
-                hidden_states,
-                self.weights[self.weight_map[f"layer_{layer_idx}_v_proj"]],
-            )
+            if self.debug and layer_idx == 0:
+                print(f"After RMS norm 1: {x.shape}")
 
-            q_dim = q.size(-1)
-            k_dim = k.size(-1)
-            v_dim = v.size(-1)
+            # self-attention
+            hidden_size = self.config["hidden_size"]
+            num_heads = self.config["num_attention_heads"]
+            num_kv_heads = self.config["num_key_value_heads"]
+            head_dim = self.config["head_dim"]
 
-            q_head_dim = q_dim // self.num_heads
-            k_head_dim = k_dim // self.num_kv_heads
-            v_head_dim = v_dim // self.num_kv_heads
-
-            q = q.view(batch_size, seq_length, self.num_heads, q_head_dim).transpose(
-                1, 2
-            )
-            k = k.view(batch_size, seq_length, self.num_kv_heads, k_head_dim).transpose(
-                1, 2
-            )
-            v = v.view(batch_size, seq_length, self.num_kv_heads, v_head_dim).transpose(
-                1, 2
-            )
-
-            if self.num_heads > self.num_kv_heads:
-                repeats = self.num_heads // self.num_kv_heads
-                k = k.repeat_interleave(repeats, dim=0)
-                v = v.repeat_interleave(repeats, dim=0)
-                # Reshape the batch dimension back
-                k = k.reshape(batch_size, self.num_heads, seq_length, k_head_dim)
-                v = v.reshape(batch_size, self.num_heads, seq_length, v_head_dim)
-
-            q, k = self._apply_rotary_emb(q, k, position_ids)
-
-            attention_scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(
-                q_head_dim
-            )
-
-            causal_mask = (
-                torch.triu(
-                    torch.ones(seq_length, seq_length, device=input_ids.device),
-                    diagonal=1,
+            if self.debug and layer_idx == 0:
+                print(
+                    f"num_heads: {num_heads}, num_kv_heads: {num_kv_heads}, head_dim: {head_dim}"
                 )
-                .bool()
-                .unsqueeze(0)
-                .unsqueeze(0)
+
+            # qkv proj
+            q = F.linear(x, layer_weights["q_proj_weight"])
+            k = F.linear(x, layer_weights["k_proj_weight"])
+            v = F.linear(x, layer_weights["v_proj_weight"])
+
+            if self.debug and layer_idx == 0:
+                print(
+                    f"q raw shape: {q.shape}, k raw shape: {k.shape}, v raw shape: {v.shape}"
+                )
+
+            # multi-head attention reshape
+            q = q.view(batch_size, seq_len, num_heads, head_dim)
+            k = k.view(batch_size, seq_len, num_kv_heads, head_dim)
+            v = v.view(batch_size, seq_len, num_kv_heads, head_dim)
+
+            if self.debug and layer_idx == 0:
+                print(
+                    f"q reshaped: {q.shape}, k reshaped: {k.shape}, v reshaped: {v.shape}"
+                )
+
+            # RoPE to q k
+            if self.debug and layer_idx == 0:
+                print("\nApplying rotary embeddings to q:")
+            q = self._rotary_embedding(q, seq_len)
+
+            if self.debug and layer_idx == 0:
+                print("\nApplying rotary embeddings to k:")
+            k = self._rotary_embedding(k, seq_len)
+
+            if self.debug and layer_idx == 0:
+                print(f"q rotary: {q.shape}, k rotary: {k.shape}")
+
+            # attention calculation transpose
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+
+            if self.debug and layer_idx == 0:
+                print(
+                    f"q transposed: {q.shape}, k transposed: {k.shape}, v transposed: {v.shape}"
+                )
+
+            # repeat kv for every head in GQA
+            if num_heads > num_kv_heads:
+                heads_per_kv = num_heads // num_kv_heads
+
+                k = k.repeat_interleave(heads_per_kv, dim=1)
+                v = v.repeat_interleave(heads_per_kv, dim=1)
+
+                if self.debug and layer_idx == 0:
+                    print(f"k after repeat: {k.shape}, v after repeat: {v.shape}")
+
+            attn_output = self._attention(q, k, v, causal_mask)
+
+            if self.debug and layer_idx == 0:
+                print(f"Attention output: {attn_output.shape}")
+
+            # reshape
+            attn_output = (
+                attn_output.transpose(1, 2)
+                .contiguous()
+                .view(batch_size, seq_len, hidden_size)
             )
-            attention_scores.masked_fill_(causal_mask, float("-inf"))
 
-            attention_weights = F.softmax(attention_scores, dim=-1)
-            context_layer = torch.matmul(attention_weights, v)
+            if self.debug and layer_idx == 0:
+                print(f"Attention output reshaped: {attn_output.shape}")
 
-            context_layer = context_layer.transpose(1, 2).contiguous()
-            context_layer = context_layer.view(batch_size, seq_length, self.hidden_size)
+            # out proj
+            attn_output = F.linear(attn_output, layer_weights["o_proj_weight"])
 
-            attn_output = F.linear(
-                context_layer,
-                self.weights[self.weight_map[f"layer_{layer_idx}_o_proj"]],
+            if self.debug and layer_idx == 0:
+                print(f"After output projection: {attn_output.shape}")
+
+            x = residual + attn_output
+
+            if self.debug and layer_idx == 0:
+                print(f"After residual 1: {x.shape}")
+
+            # 2nd RMSNorm
+            residual = x
+            x = self._rms_norm(
+                x,
+                layer_weights["post_attention_layernorm_weight"],
+                self.config["rms_norm_eps"],
             )
 
-            hidden_states = attn_output + residual
+            if self.debug and layer_idx == 0:
+                print(f"After RMS norm 2: {x.shape}")
 
-            residual = hidden_states
-            hidden_states = self._rmsnorm(
-                hidden_states,
-                self.weights[self.weight_map[f"layer_{layer_idx}_post_attn_norm"]],
+            ff_output = self._feed_forward(
+                x,
+                layer_weights["gate_proj_weight"],
+                layer_weights["up_proj_weight"],
+                layer_weights["down_proj_weight"],
             )
 
-            gate_proj = F.linear(
-                hidden_states,
-                self.weights[self.weight_map[f"layer_{layer_idx}_gate_proj"]],
-            )
-            up_proj = F.linear(
-                hidden_states,
-                self.weights[self.weight_map[f"layer_{layer_idx}_up_proj"]],
-            )
+            if self.debug and layer_idx == 0:
+                print(f"After feed-forward: {ff_output.shape}")
 
-            gate_act = F.silu(gate_proj)
-            ffn_output = gate_act * up_proj
+            x = residual + ff_output
 
-            down_proj = F.linear(
-                ffn_output,
-                self.weights[self.weight_map[f"layer_{layer_idx}_down_proj"]],
-            )
+            if self.debug and layer_idx == 0:
+                print(f"After residual 2: {x.shape}")
 
-            hidden_states = down_proj + residual
+            if layer_idx == 0:
+                self.debug = False
 
-        hidden_states = self._rmsnorm(
-            hidden_states, self.weights[self.weight_map["norm_final"]]
-        )
+        # final RMSNorm
+        x = self._rms_norm(x, self.weights["norm_weight"], self.config["rms_norm_eps"])
 
-        logits = F.linear(hidden_states, self.weights[self.weight_map["lm_head"]])
+        # logits proj
+        logits = F.linear(x, self.weights["token_embd"])
+
+        if self.debug:
+            print(f"Final logits shape: {logits.shape}")
+            print("===== End Forward Pass =====\n")
+
+        self.debug = True
 
         return logits
 
-    def generate(self, prompt, max_length=512, temperature=1.0, top_p=0.9):
-        """Generate text using greedy decoding or sampling"""
-        input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids
-        device = next(iter(self.weights.values())).device
-        input_ids = input_ids.to(device)
+    def generate(self, prompt, max_length=512, temperature=1.0, top_k=0, top_p=0.9):
+        """
+        gen text using token-by-token generation
 
-        seq_len = input_ids.shape[1]
+        Args:
+            prompt: String prompt to start generation from
+            max_length: Maximum length of the generated sequence
+            temperature: Temperature for sampling (1.0 = no change, <1.0 = more deterministic)
+            top_k: Number of highest probability tokens to keep for sampling (0 = all)
+            top_p: Cumulative probability threshold for nucleus sampling (1.0 = all)
 
-        kv_cache = {}
-        for layer_idx in range(self.num_layers):
-            kv_cache[layer_idx] = {"k": None, "v": None}
+        Returns:
+            generated_text: String of generated text
+        """
+        input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
 
-        for _ in range(max_length - seq_len):
+        if self.debug:
+            print("\n===== Generation Info =====")
+            print(f"Prompt: '{prompt}'")
+            print(f"Encoded input shape: {input_ids.shape}")
+            print(f"Tokenized IDs: {input_ids}")
+
+        if max_length > self.config["max_position_embeddings"]:
+            max_length = self.config["max_position_embeddings"]
+            print(f"Warning: max_length exceeds model capacity. Set to {max_length}")
+
+        # greedy generation or sampling
+        for i in range(max_length - input_ids.shape[1]):
+            # last max_context tokens to avoid exceeding context length and save mem
+            max_context = min(input_ids.shape[1], 2048)
+            input_context = input_ids[:, -max_context:]
+
+            if self.debug and i == 0:
+                print(f"\n--- Generation step {i} ---")
+                print(f"Context shape: {input_context.shape}")
+
+            # logits from the model
             with torch.no_grad():
-                if _ == 0:
-                    logits = self.forward(input_ids)
-                else:
-                    logits = self._forward_with_cache(
-                        input_ids[:, -1:], kv_cache, seq_len - 1
-                    )
+                logits = self.forward(input_context)
 
-                next_token_logits = logits[:, -1, :]
+            if self.debug and i == 0:
+                print(f"Logits shape: {logits.shape}")
 
-                if temperature > 0:
-                    next_token_logits = next_token_logits / temperature
+            # logits for the next token (last position)
+            next_token_logits = logits[:, -1, :].squeeze(0)
 
-                if temperature == 0:
-                    # Greedy decoding
-                    next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-                else:
-                    sorted_logits, sorted_indices = torch.sort(
-                        next_token_logits, descending=True
-                    )
-                    cumulative_probs = torch.cumsum(
-                        F.softmax(sorted_logits, dim=-1), dim=-1
-                    )
+            if self.debug and i == 0:
+                print(f"Next token logits shape: {next_token_logits.shape}")
 
-                    sorted_indices_to_remove = cumulative_probs > top_p
-                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
-                        ..., :-1
-                    ].clone()
-                    sorted_indices_to_remove[..., 0] = 0
+            # temp scaling
+            if temperature > 0:
+                next_token_logits = next_token_logits / temperature
 
-                    indices_to_remove = torch.zeros_like(
-                        next_token_logits, dtype=torch.bool
-                    ).scatter_(
-                        dim=-1, index=sorted_indices, src=sorted_indices_to_remove
-                    )
-                    next_token_logits[indices_to_remove] = -float("inf")
+            # top-k filtering
+            if top_k > 0:
+                top_k_values, top_k_indices = torch.topk(next_token_logits, top_k)
+                next_token_logits = torch.full_like(next_token_logits, float("-inf"))
+                next_token_logits.scatter_(0, top_k_indices, top_k_values)
 
-                    probs = F.softmax(next_token_logits, dim=-1)
-                    next_token = torch.multinomial(probs, num_samples=1)
+            # top-p (nucleus) filtering
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(
+                    next_token_logits, descending=True
+                )
+                cumulative_probs = torch.cumsum(
+                    F.softmax(sorted_logits, dim=-1), dim=-1
+                )
 
-                input_ids = torch.cat([input_ids, next_token], dim=-1)
-                seq_len += 1
+                # remove tokens with cumulative probability above the threshold
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
+                    ..., :-1
+                ].clone()
+                sorted_indices_to_remove[..., 0] = 0
 
-                if next_token[0].item() == self.tokenizer.eos_token_id:
-                    break
+                # scatter sorted tensors to original indexing
+                indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                next_token_logits.scatter_(0, indices_to_remove, float("-inf"))
+
+            # sample from the filtered distribution
+            probs = F.softmax(next_token_logits, dim=-1)
+            next_token = torch.multinomial(probs, 1).unsqueeze(0)
+
+            if self.debug and i == 0:
+                print(
+                    f"Selected token: {next_token.item()}, '{self.tokenizer.decode([next_token.item()])}'"
+                )
+
+            input_ids = torch.cat([input_ids, next_token], dim=-1)
+
+            if self.debug and i == 0:
+                print(f"Updated input shape: {input_ids.shape}")
+                self.debug = False
+
+            if next_token.item() == self.tokenizer.eos_token_id:
+                if self.debug:
+                    print("EOS token generated, stopping.")
+                break
+
+        self.debug = True
 
         generated_text = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
         return generated_text
-
-    def _forward_with_cache(self, input_ids, kv_cache, position_offset):
-        """Forward pass with KV caching for efficient generation"""
-        batch_size, seq_length = input_ids.shape
-
-        hidden_states = F.embedding(
-            input_ids, self.weights[self.weight_map["token_emb"]]
-        )
-
-        position_ids = torch.arange(
-            position_offset, position_offset + seq_length, device=input_ids.device
-        ).unsqueeze(0)
-
-        for layer_idx in range(self.num_layers):
-            residual = hidden_states
-            hidden_states = self._rmsnorm(
-                hidden_states,
-                self.weights[self.weight_map[f"layer_{layer_idx}_input_norm"]],
-            )
-
-            q = F.linear(
-                hidden_states,
-                self.weights[self.weight_map[f"layer_{layer_idx}_q_proj"]],
-            )
-            k = F.linear(
-                hidden_states,
-                self.weights[self.weight_map[f"layer_{layer_idx}_k_proj"]],
-            )
-            v = F.linear(
-                hidden_states,
-                self.weights[self.weight_map[f"layer_{layer_idx}_v_proj"]],
-            )
-
-            q_dim = q.size(-1)
-            k_dim = k.size(-1)
-            v_dim = v.size(-1)
-
-            q_head_dim = q_dim // self.num_heads
-            k_head_dim = k_dim // self.num_kv_heads
-            v_head_dim = v_dim // self.num_kv_heads
-
-            q = q.view(batch_size, seq_length, self.num_heads, q_head_dim).transpose(
-                1, 2
-            )
-            k = k.view(batch_size, seq_length, self.num_kv_heads, k_head_dim).transpose(
-                1, 2
-            )
-            v = v.view(batch_size, seq_length, self.num_kv_heads, v_head_dim).transpose(
-                1, 2
-            )
-
-            if self.num_heads > self.num_kv_heads:
-                repeats = self.num_heads // self.num_kv_heads
-                k = k.repeat_interleave(repeats, dim=0)
-                v = v.repeat_interleave(repeats, dim=0)
-                k = k.reshape(batch_size, self.num_heads, seq_length, k_head_dim)
-                v = v.reshape(batch_size, self.num_heads, seq_length, v_head_dim)
-
-            q, k = self._apply_rotary_emb(q, k, position_ids)
-
-            if kv_cache[layer_idx]["k"] is not None:
-                past_key = kv_cache[layer_idx]["k"]
-                past_value = kv_cache[layer_idx]["v"]
-                k = torch.cat((past_key, k), dim=2)
-                v = torch.cat((past_value, v), dim=2)
-
-            kv_cache[layer_idx]["k"] = k
-            kv_cache[layer_idx]["v"] = v
-
-            attention_scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(
-                q_head_dim
-            )
-
-            # Softmax and attention weights
-            attention_weights = F.softmax(attention_scores, dim=-1)
-            context_layer = torch.matmul(attention_weights, v)
-
-            context_layer = context_layer.transpose(1, 2).contiguous()
-            context_layer = context_layer.view(batch_size, seq_length, self.hidden_size)
-
-            attn_output = F.linear(
-                context_layer,
-                self.weights[self.weight_map[f"layer_{layer_idx}_o_proj"]],
-            )
-
-            hidden_states = attn_output + residual
-
-            residual = hidden_states
-            hidden_states = self._rmsnorm(
-                hidden_states,
-                self.weights[self.weight_map[f"layer_{layer_idx}_post_attn_norm"]],
-            )
-
-            # SwiGLU activation as used in LLaMA
-            gate_proj = F.linear(
-                hidden_states,
-                self.weights[self.weight_map[f"layer_{layer_idx}_gate_proj"]],
-            )
-            up_proj = F.linear(
-                hidden_states,
-                self.weights[self.weight_map[f"layer_{layer_idx}_up_proj"]],
-            )
-
-            gate_act = F.silu(gate_proj)
-            ffn_output = gate_act * up_proj
-
-            down_proj = F.linear(
-                ffn_output,
-                self.weights[self.weight_map[f"layer_{layer_idx}_down_proj"]],
-            )
-
-            hidden_states = down_proj + residual
-
-        hidden_states = self._rmsnorm(
-            hidden_states, self.weights[self.weight_map["norm_final"]]
-        )
-
-        logits = F.linear(hidden_states, self.weights[self.weight_map["lm_head"]])
-
-        return logits
